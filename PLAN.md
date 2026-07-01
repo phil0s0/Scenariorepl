@@ -199,6 +199,8 @@ Solve the §1.4 problem per SKU:
 - **Objective**: empirical 75th percentile of `{C(θ, ωᵢ)}` over `Ω_opt`
   (Q-PCTL; the ablation shows it beats Q-MEAN).
 - **Parallelism**: per-SKU independence ⇒ embarrassingly parallel.
+- **Substrate**: batched JAX evaluation on GPU, sharded across SKUs via
+  Kubernetes Indexed Jobs (§12).
 
 **SAA diagnostics** (explicit additions):
 
@@ -251,6 +253,16 @@ one-shot SHGO optimization: **sequential policies instead of static
 parameters**, trained over the identical scenario machinery — the scenario
 engine is reused as-is. Both papers flag this as the frontier.
 
+Two concrete routes, both over the same JAX simulator (§12.1):
+
+- **DirectBackprop** — soft-relax the discrete branches of the evaluator and
+  train a policy network by backpropagating through the rollout.
+- **MCTS via mctx** — treat the exact (non-relaxed) simulator as a perfect
+  model and search over order decisions at each review epoch (§12.4).
+
+Run both against the SAA baseline inside the Phase 5 harness before
+committing to either.
+
 ---
 
 ## 11. Dependency chain
@@ -271,3 +283,104 @@ Each stage is independently testable: coverage tests for the conformal
 quantiles, fit-quality tests for J-QPD, reproducibility/determinism tests for
 the scenario generator and evaluator, SAA-gap diagnostics for the optimizer,
 and statistical tests for the backtest.
+
+---
+
+## 12. Compute & execution architecture
+
+Four components, each with one specific job:
+
+| Component | Job |
+|---|---|
+| **JAX** | Implementation substrate for scenarios + evaluator: vectorized, jitted, differentiable |
+| **GPU** | Batch axis exploitation: SKUs × candidates × scenarios in one kernel launch |
+| **Kubernetes Indexed Jobs** | Orchestration of the embarrassingly parallel per-SKU sharding |
+| **mctx** | Phase 7 sequential-policy search over the exact JAX simulator |
+
+### 12.1 JAX evaluator core
+
+Implement `C(θ, ω)` (§6) as a pure function:
+
+- **Weekly DES as `lax.scan`** over T = 12 steps. State carried through the
+  scan: on-hand stock, in-transit pipeline (a fixed-length vector indexed by
+  weeks-to-arrival), pending-returns vector. Policy logic — the (s, Q)
+  reorder rule, `t₀`/`Q₀` initial order, `t_limit` cutoff — expressed
+  branch-free with `jnp.where`, so the whole rollout jit-compiles.
+- **Scenario generation on-device.** The J-QPD inverse CDF (§4) is
+  closed-form (a Johnson transform of normal quantiles), so
+  `d_t = Q_t(u_t)` with `u_t` from `jax.random.uniform` is a few
+  element-wise ops. Bootstrap lead-time/return-delay draws are
+  `jax.random.choice` over historical pools. **Common random numbers become
+  key discipline**: `fold_in(key, sku_id)` then `fold_in(·, scenario_id)` —
+  every candidate θ sees identical scenarios by construction, and scenarios
+  never need to be materialized to disk unless wanted for audit.
+- **Three nested `vmap`s**: scenarios (N) × candidate policies (P) × SKUs
+  (B). One jitted call produces a B × P × N cost tensor; the SAA objective
+  is `jnp.percentile(costs, 75, axis=scenario_axis)`.
+- **Determinism stays testable** (§6's hard requirement): fixed keys, no
+  nondeterministic ops; assert bit-identical costs across repeated calls.
+- **Differentiability for free**: the same code with soft relaxations of the
+  `where`-branches (sigmoid instead of step for the reorder trigger) is the
+  differentiable simulator Phase 7's DirectBackprop needs.
+
+### 12.2 GPU batching
+
+- The optimizer's entire population is scored in **one batched evaluation**:
+  P candidates × N = 500 scenarios × B SKUs of 12-step scans per launch.
+  Percentile reduction happens on-device; only the P objective values (or
+  just the argmin) cross back to host.
+- **Keep the optimization loop on-device where possible**: a JAX-native
+  population method (e.g. evosax's differential evolution / CMA-ES) keeps
+  the full optimize step inside jit. SHGO remains a host-side SciPy loop —
+  acceptable, since each of its objective calls is still a single batched
+  GPU evaluation, but the population-based route avoids per-iteration
+  host↔device round-trips.
+- **Sizing**: float32 throughout; shard size B is tuned to GPU memory
+  against the B × P × N working set. The final `Ω_eval` re-scoring
+  (N ≥ 2000, §5) is one extra batched pass over the surviving θ*.
+
+### 12.3 Kubernetes Indexed Jobs
+
+Per-SKU independence (§1.5) maps directly onto indexed completion:
+
+- **Sharding**: a prep step writes a deterministic manifest
+  (index → SKU list) plus per-shard inputs (J-QPD parameters, bootstrap
+  pools, cost parameters) to object storage as parquet. One `Job` with
+  `completionMode: Indexed`, `completions: K`,
+  `parallelism: min(K, GPU quota)`. Each pod reads
+  `JOB_COMPLETION_INDEX`, loads its shard, runs the §12.2 optimization,
+  writes `θ*` + SAA diagnostics to `results/shard={index}/`.
+- **Idempotence ⇒ cheap retries**: fixed seeds make every shard rerunnable
+  with identical output, so `backoffLimitPerIndex` and spot/preemptible GPU
+  nodes are safe. Failed indexes retry without touching completed ones.
+- **Scheduling**: `nvidia.com/gpu: 1` per pod with the GPU pool's
+  nodeSelector/tolerations; a CPU-only shard class for long-tail SKUs whose
+  batch sizes don't justify GPU queue time.
+- **Reuse of the pattern**: the walk-forward backtest (§8) runs as a second
+  indexed Job with index = execution date × policy arm; SAA optimality-gap
+  batches (§7) as index = batch id. The daily production run (§9) is a
+  CronJob triggering the phase DAG (Argo Workflows or chained Jobs).
+
+### 12.4 mctx for the Phase 7 sequential policy
+
+mctx is JAX-native MCTS, so it composes directly with the jitted simulator —
+no environment bridging, and search batches across SKUs/root states via
+`vmap` on the same GPUs.
+
+- **MDP framing** (per SKU): state = (week, on-hand, in-transit vector,
+  pending returns); action = order quantity from a discretized grid
+  (including 0 = no order); transitions = scenario draws from the §5 engine.
+- **Perfect model, not learned**: in MuZero terms the "dynamics network" is
+  replaced by the exact simulator step — no model learning stage. Use
+  `mctx.stochastic_muzero_policy` with chance nodes over discretized demand
+  outcomes (binned from the J-QPD quantiles), or root-sampled scenarios with
+  `mctx.gumbel_muzero_policy` when the search budget per decision is small.
+- **Two deployment modes**: (a) *receding-horizon planner* — run the search
+  at each review epoch and execute the visit-count argmax; this is the
+  strong sequential benchmark against static θ*; (b) *policy improvement
+  operator* — distill visit distributions into a policy network
+  (AlphaZero-style), amortizing search into an inference-time policy as
+  cheap as the static rule.
+- **Everything upstream carries over unchanged**: scenario engine, CRN key
+  discipline, and the Ω_opt/Ω_eval split (§5) are identical; evaluation
+  still happens in the Phase 5 harness against the SAA baseline.
