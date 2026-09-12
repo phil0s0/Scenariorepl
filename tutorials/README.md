@@ -36,6 +36,14 @@ pip install -e ".[tutorials]"          # from the repository root
 jupyter lab tutorials/
 ```
 
+Everything here runs on CPU. If you do not want PyEPO's PyTorch dependency to
+drag in the CUDA wheels, install torch first:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e ".[tutorials]"
+```
+
 Python **3.9–3.11** (cyclic-boosting pins `<3.12`). Exactly resolved versions are
 in [`requirements.txt`](requirements.txt). No optimization solver is needed —
 the PyEPO model is backed by `scipy.optimize.linprog`.
