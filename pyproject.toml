@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "srsim"
+version = "0.1.0"
+description = "Teaching code for the Scenariorepl tutorials: a retail demand simulator, J-QPD forecasts, a PyEPO allocation model, and a miniature ZEOS replenishment engine."
+requires-python = ">=3.9,<3.12"
+dependencies = [
+    "numpy<2",
+    "pandas<3",
+    "scipy>=1.10",
+    "scikit-learn",
+    "matplotlib",
+    "joblib",
+]
+
+[project.optional-dependencies]
+tutorials = [
+    "cyclic-boosting==1.4.0",
+    "pyepo==2.2.7",
+    "torch>=2",
+    "lightgbm",
+    "jupyter",
+    "nbconvert",
+]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]

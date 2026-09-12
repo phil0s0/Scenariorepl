@@ -1,5 +1,10 @@
 # Scenario-Based Stochastic Replenishment Optimization — Build Plan
 
+> **New here?** Start with [`tutorials/`](tutorials/). Two executable notebooks
+> build the ideas in this plan from scratch on a simulated world small enough to
+> run on a laptop: decision-focused learning with PyEPO, then the
+> simulation-assisted stochastic optimization this plan scales up.
+
 This plan synthesizes two papers into one deployable system: Zalando's ZEOS
 replenishment architecture as the backbone, with Amazon's exogenous-demand
 paper informing data correction and a later RL upgrade path. The core
@@ -36,8 +41,9 @@ the planning horizon T = 12 weeks (per SKU):
 
 - **Demand path** `d_t = Q_t(u_t)` with `u_t ~ U(0,1)` — inverse-transform
   sampling from the per-SKU-week J-QPD quantile function (§4)
-- **Lead times** `L_i` — nonparametric bootstrap from historical lead-time
-  observations
+- **Lead times** `L_i` — gamma-distributed, parameterized by user-specified base
+  values (this is what the Zalando paper does; only *return* lead times are drawn
+  from fitted historical return data)
 - **Return delays** `r_j` (and return quantities via the return rate) —
   nonparametric bootstrap from historical return observations
 
@@ -162,8 +168,9 @@ The explicit new module. Responsibilities:
   policy candidate the optimizer evaluates (§1.4).
 - **In-sample / out-of-sample discipline**:
   - `Ω_opt` — N ≈ 500 scenarios used *only* for optimization
-  - `Ω_eval` — a *fresh* N ≥ 2000 scenarios used *only* for final policy
-    evaluation and reporting
+  - `Ω_eval` — a *fresh* N = 5000 scenarios used *only* for final policy
+    evaluation and reporting (the paper's figure: 500 trajectories to optimize,
+    5000 to evaluate)
 
   Evaluating a policy on the scenarios it was optimized against overstates
   its performance (**SAA optimism bias** — the optimizer has partially fit
@@ -238,8 +245,11 @@ distribution rather than the model's.
 - Daily batch recommendations.
 - Anti-leakage guardrails on feature freeze dates.
 - **Forecast-WAPE monitoring** as the leading health indicator: Zalando
-  found ρ ≈ −0.85 between forecast WAPE and profit uplift, so forecast
-  degradation predicts policy degradation before the P&L shows it.
+  found ρ ≈ −0.71 between forecast WAPE and profit-contribution uplift (and
+  ≈ −0.68 against service-level uplift), so forecast degradation predicts policy
+  degradation before the P&L shows it. Note these are the figures in the
+  *corrected* article (Sci Rep 16:4211, 2026); the original PDF reports −0.85
+  and −0.81.
 
 ---
 
@@ -337,7 +347,7 @@ Implement `C(θ, ω)` (§6) as a pure function:
   host↔device round-trips.
 - **Sizing**: float32 throughout; shard size B is tuned to GPU memory
   against the B × P × N working set. The final `Ω_eval` re-scoring
-  (N ≥ 2000, §5) is one extra batched pass over the surviving θ*.
+  (N = 5000, §5) is one extra batched pass over the surviving θ*.
 
 ### 12.3 Kubernetes Indexed Jobs
 
